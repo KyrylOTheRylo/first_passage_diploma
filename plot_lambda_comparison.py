@@ -1,94 +1,69 @@
+import argparse
 import json
 from pathlib import Path
 
 import numpy as np
 
 from first_passage_process import PassageMethod, TelegraphProcess
+from theoretical_telegraph import (
+    theory_mean_either,
+    theory_mean_left_conditional,
+    theory_mean_right_conditional,
+    theory_p_left,
+    theory_p_right,
+)
 
 
-def plot_results(all_results, x_values):
-    import matplotlib.pyplot as plt
-
-    if len(all_results) == 1:
-        fig, ax = plt.subplots(figsize=(9, 5))
-        lam, curves = all_results[0]
-        ax.scatter(x_values, curves["either"], label="Either side", s=28)
-        ax.scatter(x_values, curves["left_conditional"], label="Left side first", s=28)
-        ax.scatter(x_values, curves["right_conditional"], label="Right side first", s=28)
-        ax.set_xlabel("Initial point x0")
-        ax.set_ylabel("Mean time to hit")
-        ax.set_title(f"First-passage time vs initial point (lambda={lam})")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        fig.tight_layout()
-        plt.show()
-    else:
-        fig, axes = plt.subplots(nrows=len(all_results), ncols=1, figsize=(9, 5 * len(all_results)), sharex=True)
-        for i, (lam, curves) in enumerate(all_results):
-            ax = axes[i]
-            ax.scatter(x_values, curves["either"], label="Either side", s=28)
-            ax.scatter(x_values, curves["left_conditional"], label="Left side first", s=28)
-            ax.scatter(x_values, curves["right_conditional"], label="Right side first", s=28)
-            ax.set_ylabel("Mean time to hit")
-            ax.set_title(f"lambda={lam}")
-            ax.grid(True, alpha=0.3)
-            ax.legend()
-        axes[-1].set_xlabel("Initial point x0")
-        fig.tight_layout()
-        plt.show()
+def build_parser():
+    parser = argparse.ArgumentParser(description="Compare first-passage curves across lambda values with theory overlays.")
+    parser.add_argument("--left", type=float, default=0.0)
+    parser.add_argument("--right", type=float, default=1.0)
+    parser.add_argument("--speed", type=float, default=0.1)
+    parser.add_argument("--lambda-rates", type=float, nargs="+", default=[0.1, 1.0, 10.0])
+    parser.add_argument("--x-points", type=int, default=30)
+    parser.add_argument("--paths-per-x", type=int, default=10_000)
+    parser.add_argument("--max-time", type=float, default=1000.0)
+    parser.add_argument("--num-processes", type=int, default=None)
+    parser.add_argument("--seed-offset", type=int, default=0)
+    parser.add_argument("--save-json", type=Path, default=Path("lambda_comparison.json"))
+    parser.add_argument("--save-plots", action="store_true")
+    parser.add_argument("--plot-dir", type=Path, default=Path("figures"))
+    parser.add_argument(
+        "--show-theory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show theoretical overlays",
+    )
+    parser.add_argument("--no-show", action="store_true")
+    return parser
 
 
-def main():
-    # Hardcoded parameters for lambda comparison
-    left = 0.0
-    right = 1.0
-    speed = 0.1
-    lambda_values = [1.0, 2.0, 2/3, 4, 0.1]
-    x_points = 30
-    paths_per_x = 10000
-    max_time = 1000.0
-    num_processes = None
-    seed_offset = 0
-
-    if left >= right:
-        raise ValueError("left must be smaller than right")
-    if speed <= 0.0:
-        raise ValueError("speed must be positive")
-    if x_points < 2:
-        raise ValueError("x_points must be at least 2")
-    if paths_per_x <= 0:
-        raise ValueError("paths_per_x must be positive")
-    if max_time <= 0.0:
-        raise ValueError("max_time must be positive")
-
-    for lam in lambda_values:
-        if lam <= 0.0:
-            raise ValueError("All lambda values must be positive")
-
-    span = right - left
+def run_sweep(args):
+    span = args.right - args.left
     eps = max(1e-12, 1e-9 * span)
-    x_values = np.linspace(left + eps, right - eps, x_points)
+    x_values = np.linspace(args.left + eps, args.right - eps, args.x_points)
+    by_lambda = []
 
-    all_results = []
+    for lambda_idx, lam in enumerate(args.lambda_rates):
+        mean_either = np.full(args.x_points, np.nan, dtype=np.float64)
+        mean_left = np.full(args.x_points, np.nan, dtype=np.float64)
+        mean_right = np.full(args.x_points, np.nan, dtype=np.float64)
+        p_left_mc = np.full(args.x_points, np.nan, dtype=np.float64)
+        p_right_mc = np.full(args.x_points, np.nan, dtype=np.float64)
 
-    for lambda_idx, lam in enumerate(lambda_values):
-        mean_either = np.full(x_points, np.nan, dtype=np.float64)
-        mean_left = np.full(x_points, np.nan, dtype=np.float64)
-        mean_right = np.full(x_points, np.nan, dtype=np.float64)
-
-        lambda_seed_base = seed_offset + lambda_idx * x_points * paths_per_x
+        lambda_seed_base = args.seed_offset + lambda_idx * args.x_points * args.paths_per_x
         for i, x0 in enumerate(x_values):
             sim = TelegraphProcess(
                 x0=float(x0),
-                left_side=left,
-                right_side=right,
-                speed=speed,
+                left_side=args.left,
+                right_side=args.right,
+                speed=args.speed,
                 lambda_rate=lam,
-                num_paths=paths_per_x,
+                num_paths=args.paths_per_x,
                 passage_method=PassageMethod.EITHER_SIDE,
-                num_processes=num_processes,
-                max_simulation_time=max_time,
-                seed_offset=lambda_seed_base + i * paths_per_x,
+                num_processes=args.num_processes,
+                max_simulation_time=args.max_time,
+                seed_offset=lambda_seed_base + i * args.paths_per_x,
             )
             result = sim.run_all_passage_simulations()
 
@@ -103,50 +78,129 @@ def main():
             if right_valid.size > 0:
                 mean_right[i] = np.mean(right_valid)
 
-        curves = {
-            "either": mean_either,
-            "left_conditional": mean_left,
-            "right_conditional": mean_right,
-        }
-        all_results.append((lam, curves))
+            p_right_mc[i] = np.mean(result["right_hit_indicator"])
+            p_left_mc[i] = np.mean(result["left_hit_indicator"])
 
-    # Plot the results
-    plot_results(all_results, x_values)
+        by_lambda.append(
+            {
+                "lambda_rate": float(lam),
+                "mc": {
+                    "either": mean_either,
+                    "left_conditional": mean_left,
+                    "right_conditional": mean_right,
+                    "left_first": p_left_mc,
+                    "right_first": p_right_mc,
+                },
+                "theory": {
+                    "either": theory_mean_either(x_values, args.left, args.right, args.speed, lam),
+                    "left_conditional": theory_mean_left_conditional(x_values, args.left, args.right, args.speed, lam),
+                    "right_conditional": theory_mean_right_conditional(x_values, args.left, args.right, args.speed, lam),
+                    "left_first": theory_p_left(x_values, args.left, args.right, args.speed, lam),
+                    "right_first": theory_p_right(x_values, args.left, args.right, args.speed, lam),
+                },
+            }
+        )
+    return x_values, by_lambda
 
-    # Optionally save to JSON
-    save_json = Path("lambda_comparison.json")
+
+def plot_results(x_values, by_lambda, speed, show_theory=True):
+    import matplotlib.pyplot as plt
+
+    n = len(by_lambda)
+    fig_times, axes_times = plt.subplots(n, 1, figsize=(10, 4.5 * n), sharex=True)
+    fig_probs, axes_probs = plt.subplots(n, 1, figsize=(10, 4.5 * n), sharex=True)
+    if n == 1:
+        axes_times = [axes_times]
+        axes_probs = [axes_probs]
+
+    for i, row in enumerate(by_lambda):
+        lam = row["lambda_rate"]
+        mc = row["mc"]
+        th = row["theory"]
+
+        ax_t = axes_times[i]
+        ax_t.scatter(x_values, mc["either"], s=18, label="Either MC", color="#1f77b4")
+        ax_t.scatter(x_values, mc["left_conditional"], s=18, label="Left cond. MC", color="#d62728")
+        ax_t.scatter(x_values, mc["right_conditional"], s=18, label="Right cond. MC", color="#2ca02c")
+        if show_theory:
+            ax_t.plot(x_values, th["either"], lw=2, label="T(y) theory", color="#1f77b4")
+            ax_t.plot(x_values, th["left_conditional"], lw=2, label="T_L(y) theory", color="#d62728")
+            ax_t.plot(x_values, th["right_conditional"], lw=2, label="T_R(y) theory", color="#2ca02c")
+        ax_t.set_title(f"Mean Exit Times (a={lam}, v={speed})")
+        ax_t.grid(True, alpha=0.3)
+        ax_t.legend()
+
+        ax_p = axes_probs[i]
+        ax_p.scatter(x_values, mc["right_first"], s=18, label="Right first MC", color="#9467bd")
+        ax_p.scatter(x_values, mc["left_first"], s=18, label="Left first MC", color="#ff7f0e")
+        if show_theory:
+            ax_p.plot(x_values, th["right_first"], lw=2, label="P_R(y) theory", color="#9467bd")
+            ax_p.plot(x_values, th["left_first"], lw=2, label="P_L(y) theory", color="#ff7f0e")
+        ax_p.set_title(f"Splitting Probabilities (a={lam}, v={speed})")
+        ax_p.set_ylim(-0.02, 1.02)
+        ax_p.grid(True, alpha=0.3)
+        ax_p.legend()
+
+    axes_times[-1].set_xlabel("Initial point x0")
+    axes_probs[-1].set_xlabel("Initial point x0")
+    fig_times.tight_layout()
+    fig_probs.tight_layout()
+    return fig_times, fig_probs
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.left >= args.right:
+        raise ValueError("--left must be smaller than --right")
+    if args.speed <= 0.0:
+        raise ValueError("--speed must be positive")
+    if args.x_points < 2:
+        raise ValueError("--x-points must be at least 2")
+    if args.paths_per_x <= 0:
+        raise ValueError("--paths-per-x must be positive")
+    if args.max_time <= 0.0:
+        raise ValueError("--max-time must be positive")
+    if any(lam <= 0.0 for lam in args.lambda_rates):
+        raise ValueError("All lambda values must be positive")
+
+    x_values, by_lambda = run_sweep(args)
+    fig_times, fig_probs = plot_results(x_values, by_lambda, args.speed, show_theory=args.show_theory)
+
+    if args.save_plots:
+        args.plot_dir.mkdir(parents=True, exist_ok=True)
+        fig_times.savefig(args.plot_dir / "lambda_comparison_times.png", dpi=160)
+        fig_probs.savefig(args.plot_dir / "lambda_comparison_probabilities.png", dpi=160)
+
+    if not args.no_show:
+        import matplotlib.pyplot as plt
+
+        plt.show()
+
     payload = {
         "x0": x_values.tolist(),
         "by_lambda": [
             {
-                "lambda_rate": float(lam),
-                "either": curves["either"].tolist(),
-                "left_conditional": curves["left_conditional"].tolist(),
-                "right_conditional": curves["right_conditional"].tolist(),
+                "lambda_rate": row["lambda_rate"],
+                "mc": {k: v.tolist() for k, v in row["mc"].items()},
+                "theory": {k: v.tolist() for k, v in row["theory"].items()},
             }
-            for lam, curves in all_results
+            for row in by_lambda
         ],
         "params": {
-            "left": left,
-            "right": right,
-            "speed": speed,
-            "lambda_rates": [float(lam) for lam in lambda_values],
-            "x_points": x_points,
-            "paths_per_x": paths_per_x,
-            "max_time": max_time,
-            "num_processes": num_processes,
-            "seed_offset": seed_offset,
+            "left": args.left,
+            "right": args.right,
+            "speed": args.speed,
+            "lambda_rates": [float(lam) for lam in args.lambda_rates],
+            "x_points": args.x_points,
+            "paths_per_x": args.paths_per_x,
+            "max_time": args.max_time,
+            "num_processes": args.num_processes,
+            "seed_offset": args.seed_offset,
         },
     }
-    save_json.parent.mkdir(parents=True, exist_ok=True)
-    save_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print(f"Saved comparison data to {save_json}")
-
-    print(f"Generated {len(x_values)} x0 points in ({left}, {right}).")
-    print(
-        "Curves per lambda: either, left_conditional, right_conditional "
-        f"(lambdas: {', '.join(str(lam) for lam in lambda_values)})"
-    )
+    args.save_json.parent.mkdir(parents=True, exist_ok=True)
+    args.save_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"Saved comparison data to {args.save_json}")
 
 
 if __name__ == "__main__":
